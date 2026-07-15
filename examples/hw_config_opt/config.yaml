@@ -1,0 +1,96 @@
+# OpenEvolve config for the hardware-config-optimization task.
+# The search: minimize energy/inference and latency/inference (the two MAP-Elites
+# feature axes) subject to a fixed accuracy floor (enforced in the evaluator).
+# The archive becomes an energy x latency trade-off map.
+
+max_iterations: 30
+checkpoint_interval: 10
+diff_based_evolution: true
+max_code_length: 8000
+
+# Uses Claude via Anthropic's OpenAI-compatible endpoint. Export your Anthropic
+# key as ANTHROPIC_API_KEY before running (resolved into api_key below).
+llm:
+  primary_model: "claude-sonnet-5"
+  primary_model_weight: 1.0
+  api_base: "https://api.anthropic.com/v1/"
+  api_key: "${ANTHROPIC_API_KEY}"
+  # Claude (Sonnet 5 / Opus 4.7+) rejects `temperature`; the LLM client omits it
+  # automatically for claude/anthropic models, so this value is ignored here.
+  # It applies only if you switch primary_model to a provider that accepts it.
+  temperature: null
+  max_tokens: 8000
+  timeout: 120
+
+prompt:
+  # run_task.py overwrites system_message per-device, assembling this
+  # lead-in + knowledge/hardware/<device>.md + knowledge/constraints/*. This
+  # static copy is used only if the evaluator is called without run_task.py,
+  # so it is device-agnostic and has no knob table appended.
+  system_message: |
+    You are an expert embedded-systems performance engineer tuning the runtime
+    configuration of an embedded device running an ML inference workload. Your
+    objective is to find knob settings that MINIMIZE energy per inference (mJ)
+    and latency per inference (ms) while keeping accuracy at or above the fixed
+    floor.
+
+    # WHAT YOU EDIT
+    You edit ONLY the values in the `CONFIG` dict inside the EVOLVE-BLOCK. You
+    do not change the dict's shape, add keys, or touch code outside the block.
+    Every key you emit MUST appear in the device's valid-knob table (see
+    knowledge/hardware/<device>.md); the evaluator REJECTS any unknown key, so
+    an invented knob wastes the whole attempt.
+
+    # OPTIMIZATION STRATEGY
+    1. Energy and latency usually TRADE OFF. The lowest-latency setting (e.g.
+       max frequency) is often the worst on energy-per-inference. Hunt for the
+       KNEE of the curve, not the extreme.
+    2. Prefer cheap RUNTIME knobs first. Knobs applied over serial after
+       power-on (e.g. frequency, sleep mode) cost seconds to try. BUILD-TIME
+       knobs (e.g. compiler optimization) force a rebuild+reflash and cost
+       minutes — change them only once the cheap axes are well explored, and
+       change one at a time.
+    3. Sleep / low-power modes cut idle energy but can add wake latency;
+       frequency scaling trades power against speed. Reason about which
+       dominates for the workload before proposing a value.
+    4. Move deliberately: change ONE knob per step when possible so the measured
+       history stays interpretable. Don't jump to an untested extreme.
+
+    # HOW TO USE THE MEASURED HISTORY
+    The prompt includes prior configs with their MEASURED energy/latency/score
+    from real hardware. Trust those numbers — a trusted wrapper produced them,
+    not the candidate. Read the trend, form a hypothesis, and propose the config
+    that best advances the energy x latency frontier. Repeating a config already
+    in the history learns nothing.
+
+    # HARD RULES
+    - Emit ONLY knob values from the device's valid-knob table. No invented knobs.
+    - NEVER add energy, latency, accuracy, score, or any metric field — self-
+      reported metrics are discarded as invalid. Selection is your job; scoring
+      is the wrapper's.
+    - Stay within each knob's stated range/allowed values and respect any device
+      note marking a knob build-time, single-core-only, or not-wired.
+    - Keep accuracy above the floor. These knobs don't change model outputs, so
+      accuracy is fixed and looked up — but a knob the device can't sustain
+      still counts as a failed attempt.
+  num_top_programs: 3
+  num_diverse_programs: 2
+
+database:
+  population_size: 40
+  num_islands: 3
+  # MAP-Elites axes = the two objectives. The archive becomes the energy x
+  # latency frontier, one best-fitness config per cell. Both are custom metrics
+  # returned by the evaluator.
+  feature_dimensions:
+    - energy_mj
+    - latency_ms
+  feature_bins: 10
+
+evaluator:
+  # HARD REQUIREMENT: one PPK2 + one USB hub = measurements are SERIAL. Do not
+  # raise this above 1 or parallel workers will collide on the same hardware.
+  parallel_evaluations: 1
+  # A flash + 10 s capture (and a full rebuild+reflash when the `opt` knob
+  # changes) can take minutes; give the worker plenty of headroom.
+  timeout: 600
